@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Wayland
 import "../../common"
@@ -9,111 +10,148 @@ Variants {
 
     PanelWindow {
         id: root
-        required property var modelData // screen
+        required property var modelData
         screen: modelData
-
         color: "transparent"
 
-        // Default top layer (floating above windows), toggle to bottom with shortcut
+        property bool hasContent: NotePersistence.notes.count > 0 || NotePersistence.groups.count > 0
+
         WlrLayershell.namespace: "caelestia-notes"
-        WlrLayershell.layer: layerHidden || NotePersistence.notes.count === 0 ? WlrLayer.Bottom : WlrLayer.Top
+        WlrLayershell.layer: layerHidden || !hasContent ? WlrLayer.Bottom : WlrLayer.Top
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
-        // Ensure it doesn't reserve space
         WlrLayershell.exclusionMode: ExclusionMode.Ignore
 
-        // Tracks the actual layer state, delayed on hide so fade-out plays first
         property bool layerHidden: NoteBoardState.hidden
         Connections {
             target: NoteBoardState
             function onHiddenChanged() {
-                notesRepeater.animating = true;
+                boardContent.animating = true;
                 implodeAnim.start();
             }
         }
 
-        // Background (or no notes): full input for right-click to add notes
-        // Foreground with notes: only note areas receive input
-        mask: layerHidden || NotePersistence.notes.count === 0 ? null : notesMask
+        mask: layerHidden || !hasContent ? null : inputMask
 
         Region {
-            id: notesMask
+            id: inputMask
             width: 0
             height: 0
-            regions: noteRegions.instances
+            regions: allRegions.instances
         }
 
         Variants {
-            id: noteRegions
-            model: notesRepeater.children
-
+            id: allRegions
+            model: {
+                var regions = [];
+                for (var g = 0; g < NotePersistence.groups.count; g++) {
+                    var grp = NotePersistence.groups.get(g);
+                    var size = NoteBoardState.groupSizes[grp.groupId] || {width: 200, height: 100};
+                    regions.push({x: grp.groupX, y: grp.groupY, w: size.width, h: size.height});
+                }
+                for (var n = 0; n < NotePersistence.notes.count; n++) {
+                    var note = NotePersistence.notes.get(n);
+                    if (!note.groupId || note.groupId === "")
+                        regions.push({x: note.noteX, y: note.noteY, w: note.noteWidth, h: note.noteHeight});
+                }
+                return regions;
+            }
             Region {
-                required property Item modelData
+                required property var modelData
                 x: modelData.x
                 y: modelData.y
-                width: modelData.width
-                height: modelData.height
+                width: modelData.w
+                height: modelData.h
             }
         }
 
-        anchors {
-            top: true
-            bottom: true
-            left: true
-            right: true
-        }
+        anchors { top: true; bottom: true; left: true; right: true }
 
-        // Click to defocus notes, right-click to add
         MouseArea {
             anchors.fill: parent
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             onClicked: (mouse) => {
                 if (mouse.button === Qt.RightButton) {
-                    NotePersistence.addNote(mouse.x, mouse.y);
+                    contextMenu.x = mouse.x;
+                    contextMenu.y = mouse.y;
+                    contextMenu.open();
                 } else {
+                    NoteBoardState.clearFocus();
                     root.contentItem.forceActiveFocus();
                 }
             }
         }
 
-        Item {
-            id: notesRepeater
-            anchors.fill: parent
+        Connections {
+            target: root.contentItem
+            function onActiveFocusChanged() {
+                if (!root.contentItem.activeFocus) {
+                    NoteBoardState.clearFocus();
+                }
+            }
+        }
 
-            // Drives per-note scale: 1.0 = fully visible, 0.0 = collapsed
-            property real noteScale: 1.0
+        Menu {
+            id: contextMenu
+            property real spawnX: x
+            property real spawnY: y
+
+            background: Rectangle {
+                implicitWidth: 140
+                color: Appearance.colors.colLayer1
+                radius: 8
+                border.width: 1
+                border.color: Appearance.colors.colOutlineVariant
+            }
+
+            MenuItem {
+                text: "Add Note"
+                onTriggered: NotePersistence.addNote(contextMenu.spawnX, contextMenu.spawnY, "")
+                background: Rectangle { color: parent.hovered ? Appearance.colors.colLayer2 : "transparent" }
+                contentItem: Text { text: parent.text; color: Appearance.colors.colOnLayer1; font.pixelSize: Appearance.font.pixelSize.small; leftPadding: 10 }
+            }
+
+            MenuItem {
+                text: "Add Group"
+                onTriggered: NotePersistence.addGroup(contextMenu.spawnX, contextMenu.spawnY)
+                background: Rectangle { color: parent.hovered ? Appearance.colors.colLayer2 : "transparent" }
+                contentItem: Text { text: parent.text; color: Appearance.colors.colOnLayer1; font.pixelSize: Appearance.font.pixelSize.small; leftPadding: 10 }
+            }
+        }
+
+        Item {
+            id: boardContent
+            anchors.fill: parent
+            property real itemScale: 1.0
             property bool animating: false
 
             NumberAnimation {
                 id: implodeAnim
-                target: notesRepeater
-                property: "noteScale"
-                to: 0
-                duration: 90
-                easing.type: Easing.InBack
-                easing.overshoot: 0.7
-                onFinished: {
-                    root.layerHidden = NoteBoardState.hidden;
-                    explodeAnim.start();
-                }
+                target: boardContent; property: "itemScale"; to: 0; duration: 90
+                easing.type: Easing.InBack; easing.overshoot: 0.7
+                onFinished: { root.layerHidden = NoteBoardState.hidden; explodeAnim.start(); }
             }
 
             NumberAnimation {
                 id: explodeAnim
-                target: notesRepeater
-                property: "noteScale"
-                to: 1
-                duration: 190
-                easing.type: Easing.OutBack
-                easing.overshoot: 1.4
-                onFinished: notesRepeater.animating = false
+                target: boardContent; property: "itemScale"; to: 1; duration: 190
+                easing.type: Easing.OutBack; easing.overshoot: 1.4
+                onFinished: boardContent.animating = false
+            }
+
+            Repeater {
+                model: NotePersistence.groups
+                delegate: NoteGroup { groupScale: boardContent.itemScale }
             }
 
             Repeater {
                 model: NotePersistence.notes
                 delegate: NoteWidget {
-                    noteScale: notesRepeater.noteScale
+                    visible: !groupId || groupId === ""
+                    noteScale: boardContent.itemScale
                 }
             }
+
+
         }
     }
 }
