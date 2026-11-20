@@ -5,12 +5,20 @@ import Quickshell.Wayland
 import "../../common"
 import "../../services"
 
+// One board window per screen. Board content is offset by the screen's
+// position so all notes live in one global (virtual desktop) coordinate space.
 Variants {
     model: Quickshell.screens
 
     PanelWindow {
         id: root
-        required property var modelData
+        required property ShellScreen modelData
+        readonly property string screenName: modelData.name
+
+        // Group items on this screen keyed by groupId, and every item that takes input
+        property var groupItems: ({})
+        property var maskItems: []
+
         screen: modelData
         color: "transparent"
 
@@ -30,37 +38,52 @@ Variants {
             }
         }
 
-        mask: layerHidden || !hasContent ? null : inputMask
+        function trackItem(item: Item, isGroup: bool): void {
+            if (isGroup) {
+                var m = Object.assign({}, groupItems);
+                m[item.groupId] = item;
+                groupItems = m;
+            }
+            maskItems = maskItems.concat([item]);
+        }
+
+        function untrackItem(item: Item, isGroup: bool): void {
+            if (isGroup) {
+                var m = Object.assign({}, groupItems);
+                for (var k in m) {
+                    if (m[k] === item)
+                        delete m[k];
+                }
+                groupItems = m;
+            }
+            maskItems = maskItems.filter(i => i !== item);
+        }
+
+        mask: layerHidden || !hasContent || NoteBoardState.interacting ? null : inputMask
 
         Region {
             id: inputMask
-            width: 0
-            height: 0
-            regions: allRegions.instances
+            regions: maskRegions.instances
+
+            // Quickshell doesn't forward changes of regions that were swapped in by a list
+            // reassignment, so children poke the parent themselves. Toggling radius emits
+            // `changed` without affecting the (empty) parent rect.
+            function rebuild(): void {
+                radius = radius === 0 ? 1 : 0;
+            }
         }
 
         Variants {
-            id: allRegions
-            model: {
-                var regions = [];
-                for (var g = 0; g < NotePersistence.groups.count; g++) {
-                    var grp = NotePersistence.groups.get(g);
-                    var size = NoteBoardState.groupSizes[grp.groupId] || {width: 200, height: 100};
-                    regions.push({x: grp.groupX, y: grp.groupY, w: size.width, h: size.height});
-                }
-                for (var n = 0; n < NotePersistence.notes.count; n++) {
-                    var note = NotePersistence.notes.get(n);
-                    if (!note.groupId || note.groupId === "")
-                        regions.push({x: note.noteX, y: note.noteY, w: note.noteWidth, h: note.noteHeight});
-                }
-                return regions;
-            }
+            id: maskRegions
+            model: root.maskItems
+            // Unscaled geometry: `item:` would measure the scale animation and could stay 0x0
             Region {
-                required property var modelData
-                x: modelData.x
-                y: modelData.y
-                width: modelData.w
-                height: modelData.h
+                required property Item modelData
+                x: modelData.x + boardContent.x
+                y: modelData.y + boardContent.y
+                width: modelData.width
+                height: modelData.height
+                onChanged: inputMask.rebuild()
             }
         }
 
@@ -69,8 +92,17 @@ Variants {
         MouseArea {
             anchors.fill: parent
             acceptedButtons: Qt.LeftButton | Qt.RightButton
+            // Safety net: if a release was ever missed, the first background press
+            // restores the mask instead of leaving an invisible input blocker
+            onPressed: {
+                if (NoteBoardState.interacting)
+                    NoteBoardState.resetInteraction();
+            }
             onClicked: (mouse) => {
                 if (mouse.button === Qt.RightButton) {
+                    // Spawn point in global coordinates, kept on this screen
+                    contextMenu.spawnX = root.modelData.x + Math.min(mouse.x, root.width - NotePersistence.defaultNoteWidth);
+                    contextMenu.spawnY = root.modelData.y + Math.min(mouse.y, root.height - NotePersistence.defaultNoteHeight);
                     contextMenu.x = mouse.x;
                     contextMenu.y = mouse.y;
                     contextMenu.open();
@@ -81,19 +113,19 @@ Variants {
             }
         }
 
+        // Losing keyboard focus clears selection, unless focus moved to another screen's board
         Connections {
             target: root.contentItem
             function onActiveFocusChanged() {
-                if (!root.contentItem.activeFocus) {
+                if (!root.contentItem.activeFocus && NoteBoardState.focusScreen === root.screenName)
                     NoteBoardState.clearFocus();
-                }
             }
         }
 
         Menu {
             id: contextMenu
-            property real spawnX: x
-            property real spawnY: y
+            property real spawnX: 0
+            property real spawnY: 0
 
             background: Rectangle {
                 implicitWidth: 140
@@ -105,7 +137,8 @@ Variants {
 
             MenuItem {
                 text: "Add Note"
-                onTriggered: NotePersistence.addNote(contextMenu.spawnX, contextMenu.spawnY, "")
+                // Right-click inside a group adds the note to that group
+                onTriggered: NotePersistence.addNote(contextMenu.spawnX, contextMenu.spawnY, NoteBoardState.findGroupAt(contextMenu.spawnX, contextMenu.spawnY), root.screenName)
                 background: Rectangle { color: parent.hovered ? Appearance.colors.colLayer2 : "transparent" }
                 contentItem: Text { text: parent.text; color: Appearance.colors.colOnLayer1; font.pixelSize: Appearance.font.pixelSize.small; leftPadding: 10 }
             }
@@ -120,7 +153,8 @@ Variants {
 
         Item {
             id: boardContent
-            anchors.fill: parent
+            x: -root.modelData.x
+            y: -root.modelData.y
             property real itemScale: 1.0
             property bool animating: false
 
@@ -140,18 +174,24 @@ Variants {
 
             Repeater {
                 model: NotePersistence.groups
-                delegate: NoteGroup { groupScale: boardContent.itemScale }
+                delegate: NoteGroup {
+                    screenName: root.screenName
+                    groupScale: boardContent.itemScale
+                }
+                onItemAdded: (index, item) => root.trackItem(item, true)
+                onItemRemoved: (index, item) => root.untrackItem(item, true)
             }
 
             Repeater {
                 model: NotePersistence.notes
                 delegate: NoteWidget {
-                    visible: !groupId || groupId === ""
+                    screenName: root.screenName
+                    groupItems: root.groupItems
                     noteScale: boardContent.itemScale
                 }
+                onItemAdded: (index, item) => root.trackItem(item, false)
+                onItemRemoved: (index, item) => root.untrackItem(item, false)
             }
-
-
         }
     }
 }

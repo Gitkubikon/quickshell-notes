@@ -3,52 +3,44 @@ import QtQuick.Controls
 import "../../common"
 import "../../services"
 
+// Group frame and header. Its notes are siblings on the board that position
+// themselves relative to this item, so nothing is reparented while dragging.
 Item {
     id: root
-    required property int index
     required property string groupId
     required property real groupX
     required property real groupY
     required property string title
+    required property string screenName
 
-    property bool isFocused: NoteBoardState.focusedGroupId === groupId
-    property int zOrder: 0
-    property bool hovered: headerHover.containsMouse || titleField.activeFocus
     property real groupScale: 1.0
-    property bool isDragging: headerDragHandler.active
-    property bool dropHighlight: NoteBoardState.noteDragging &&
-        NoteBoardState.findGroupAt(NoteBoardState.dragX, NoteBoardState.dragY, "") === groupId
+    property bool editingTitle: false
 
-    property var notesInGroup: NotePersistence.getNotesInGroup(groupId)
-    property int noteCount: notesInGroup.length
+    readonly property real padding: NotePersistence.groupPadding
+    readonly property real headerHeight: NotePersistence.groupHeaderHeight
+    readonly property bool isFocused: NoteBoardState.focusedGroupId === groupId
+    readonly property bool isDragging: NoteBoardState.draggingGroupId === groupId
+    readonly property bool hovered: headerHover.hovered || editingTitle
+    readonly property bool dropHighlight: NoteBoardState.noteDragging && NoteBoardState.hoverGroupId === groupId
+    readonly property var size: NotePersistence.groupSize(groupId)
+    readonly property int noteCount: size.count
 
-    readonly property real padding: 8
-    readonly property real headerHeight: 32
-    readonly property real minWidth: 180
-    readonly property real minHeight: 70
-
-    // Freeze bounds while a note is being dragged from this group
-    property bool freezeBounds: NoteBoardState.draggingFromGroupId === groupId
-    property var contentBounds: NotePersistence.getGroupContentBounds(groupId)
-    property real contentRight: contentBounds ? contentBounds.width : 0
-    property real contentBottom: contentBounds ? contentBounds.height : 0
-    property real frozenWidth: 0
-    property real frozenHeight: 0
-
-    width: freezeBounds ? frozenWidth : Math.max(minWidth, contentRight + padding * 2)
-    height: freezeBounds ? frozenHeight : (headerHeight + (noteCount > 0 ? padding + contentBottom + padding : minHeight - headerHeight))
-
-    onFreezeBoundsChanged: {
-        if (freezeBounds) {
-            frozenWidth = width;
-            frozenHeight = height;
-        }
-    }
-    x: groupX
-    y: groupY
+    x: isDragging ? NoteBoardState.dragGroupX : groupX
+    y: isDragging ? NoteBoardState.dragGroupY : groupY
+    z: isDragging ? 90000 : NoteBoardState.zFor(groupId)
+    width: size.width
+    height: size.height
     scale: groupScale
     opacity: groupScale
-    z: isDragging ? 9000 : (isFocused ? 4000 + zOrder : zOrder)
+
+    Behavior on width { NumberAnimation { duration: 100 } }
+    Behavior on height { NumberAnimation { duration: 100 } }
+
+    function startTitleEdit(): void {
+        editingTitle = true;
+        titleField.forceActiveFocus();
+        titleField.selectAll();
+    }
 
     // Border frame
     Rectangle {
@@ -56,9 +48,8 @@ Item {
         anchors.fill: parent
         radius: 8
         color: "transparent"
-        border.width: dropHighlight ? 3 : (isFocused ? 2 : 1)
-        border.color: dropHighlight ? Appearance.colors.colPrimary :
-                      (isFocused ? Appearance.colors.colPrimary : Appearance.colors.colOutlineVariant)
+        border.width: root.dropHighlight ? 3 : (root.isFocused ? 2 : 1)
+        border.color: root.dropHighlight || root.isFocused ? Appearance.colors.colPrimary : Appearance.colors.colOutlineVariant
 
         Behavior on border.color { ColorAnimation { duration: 100 } }
         Behavior on border.width { NumberAnimation { duration: 100 } }
@@ -71,37 +62,50 @@ Item {
         anchors.top: parent.top
         anchors.margins: 2
         height: root.headerHeight - 2
-        radius: noteCount > 0 ? 0 : 6
+        radius: root.noteCount > 0 ? 0 : 6
         topLeftRadius: 6
         topRightRadius: 6
         color: Appearance.colors.colLayer1
 
-        MouseArea {
+        HoverHandler {
             id: headerHover
-            anchors.fill: parent
-            hoverEnabled: true
-            acceptedButtons: Qt.LeftButton
             cursorShape: Qt.OpenHandCursor
+        }
 
-            onPressed: (mouse) => {
-                root.zOrder = NoteBoardState.focusGroup(root.groupId);
-                mouse.accepted = false;  // Let DragHandler take over
+        TapHandler {
+            onPressedChanged: {
+                NoteBoardState.pointerHeld = pressed;
+                if (pressed)
+                    NoteBoardState.focusGroup(root.groupId, root.screenName);
             }
         }
 
-        // Drag handler ONLY on header - drags the whole group
+        // Whole header (title included) drags the group
         DragHandler {
             id: headerDragHandler
-            target: root
-            dragThreshold: 3
+            target: null
+            enabled: !root.editingTitle
             cursorShape: Qt.ClosedHandCursor
+
+            property real startX: 0
+            property real startY: 0
 
             onActiveChanged: {
                 if (active) {
-                    root.zOrder = NoteBoardState.focusGroup(root.groupId);
+                    NoteBoardState.focusGroup(root.groupId, root.screenName);
+                    startX = root.x;
+                    startY = root.y;
+                    NoteBoardState.beginGroupDrag(root.groupId, startX, startY);
                 } else {
-                    NotePersistence.updateGroup(root.index, { x: root.x, y: root.y });
+                    NotePersistence.updateGroup(root.groupId, { x: NoteBoardState.dragGroupX, y: NoteBoardState.dragGroupY });
+                    NoteBoardState.endGroupDrag();
                 }
+            }
+
+            onCentroidChanged: {
+                if (!active)
+                    return;
+                NoteBoardState.moveGroupDrag(startX + centroid.scenePosition.x - centroid.scenePressPosition.x, startY + centroid.scenePosition.y - centroid.scenePressPosition.y);
             }
         }
 
@@ -111,6 +115,8 @@ Item {
             anchors.right: buttons.left
             anchors.verticalCenter: parent.verticalCenter
             anchors.leftMargin: 10
+            // Disabled until clicked so it doesn't swallow header drags
+            enabled: root.editingTitle
             text: root.title
             color: Appearance.colors.colOnLayer1
             font.pixelSize: Appearance.font.pixelSize.smaller
@@ -118,15 +124,26 @@ Item {
             background: null
             selectByMouse: true
 
+            onEditingFinished: root.editingTitle = false
             onActiveFocusChanged: {
-                if (activeFocus) {
-                    root.zOrder = NoteBoardState.focusGroup(root.groupId);
-                }
+                if (!activeFocus)
+                    root.editingTitle = false;
             }
+            Keys.onEscapePressed: root.editingTitle = false
 
             onTextChanged: {
                 if (text !== root.title)
-                    NotePersistence.updateGroup(root.index, { title: text });
+                    NotePersistence.updateGroup(root.groupId, { title: text });
+            }
+        }
+
+        // Click (without dragging) on the title to rename
+        Item {
+            anchors.fill: titleField
+            visible: !root.editingTitle
+
+            TapHandler {
+                onTapped: root.startTitleEdit()
             }
         }
 
@@ -149,7 +166,7 @@ Item {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: NotePersistence.addNote(0, 0, root.groupId)
+                    onClicked: NotePersistence.addNote(0, 0, root.groupId, root.screenName)
                 }
             }
 
@@ -158,13 +175,13 @@ Item {
                 height: 24
                 radius: 4
                 color: closeMa.containsMouse ? Appearance.colors.colLayer2 : "transparent"
-                Text { anchors.centerIn: parent; text: "\u00d7"; font.pixelSize: 15; color: Appearance.colors.colSubtext }
+                Text { anchors.centerIn: parent; text: "×"; font.pixelSize: 15; color: Appearance.colors.colSubtext }
                 MouseArea {
                     id: closeMa
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: NotePersistence.removeGroup(root.index)
+                    onClicked: NotePersistence.removeGroup(root.groupId)
                 }
             }
         }
@@ -172,42 +189,11 @@ Item {
 
     Text {
         anchors.centerIn: parent
-        anchors.verticalCenterOffset: headerHeight / 2
-        visible: noteCount === 0
+        anchors.verticalCenterOffset: root.headerHeight / 2
+        visible: root.noteCount === 0
         text: "drop notes"
         font.pixelSize: Appearance.font.pixelSize.smaller
         color: Appearance.colors.colSubtext
         opacity: 0.5
     }
-
-    // Notes inside this group - they are children so they move with the group
-    Repeater {
-        model: root.notesInGroup.length
-        delegate: GroupedNote {
-            required property int index
-            property var data: root.notesInGroup[index]
-            noteIndex: data ? data.index : 0
-            noteId: data ? data.note.noteId : ""
-            noteWidth: data ? data.note.noteWidth : 180
-            noteHeight: data ? data.note.noteHeight : 100
-            text: data ? data.note.text : ""
-            groupId: root.groupId
-            localX: data ? data.note.localX : 0
-            localY: data ? data.note.localY : 0
-            groupPadding: root.padding
-            groupHeaderHeight: root.headerHeight
-            noteScale: root.groupScale
-            parentGroup: root
-            boardItem: root.parent
-        }
-    }
-
-    Behavior on width { NumberAnimation { duration: 100 } }
-    Behavior on height { NumberAnimation { duration: 100 } }
-
-    Component.onCompleted: NoteBoardState.registerGroup(groupId, x, y, width, height)
-    onXChanged: NoteBoardState.registerGroup(groupId, x, y, width, height)
-    onYChanged: NoteBoardState.registerGroup(groupId, x, y, width, height)
-    onWidthChanged: NoteBoardState.registerGroup(groupId, x, y, width, height)
-    onHeightChanged: NoteBoardState.registerGroup(groupId, x, y, width, height)
 }
